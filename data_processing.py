@@ -4,20 +4,20 @@ import numpy as np
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 import joblib
 import matplotlib.pyplot as plt
 
 def download_data():
-    """Fetch latest Bitcoin data with volume"""
+    """Fetch Bitcoin data with proper columns"""
     df = yf.download('BTC-USD', start='2014-09-17', end=pd.Timestamp.today().strftime('%Y-%m-%d'))
-    df.to_csv('bitcoin_data.csv')
-    return df
+    df.reset_index(inplace=True)
+    return df[['Date', 'Close', 'Volume']]  # Explicitly select columns
 
 def calculate_rsi(data, window=14):
-    """Compute Relative Strength Index (RSI)"""
+    """Add RSI to DataFrame"""
     delta = data['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -26,98 +26,54 @@ def calculate_rsi(data, window=14):
     avg_loss = loss.rolling(window).mean()
     
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    data['RSI'] = 100 - (100 / (1 + rs))
+    return data
 
 def preprocess_data(df, lookback=90):
-    """Create time-series sequences with multiple features"""
-    # Calculate technical indicators
-    df['RSI'] = calculate_rsi(df)
-    df = df.dropna()
+    """Process data and return aligned features"""
+    df = calculate_rsi(df).dropna()
     
-    # Select features
+    # Define features and target
     features = ['Close', 'Volume', 'RSI']
-    scaler = MinMaxScaler(feature_range=(0,1))
-    scaled_data = scaler.fit_transform(df[features])
+    target = 'Close'
+    
+    # Initialize scalers
+    feature_scaler = MinMaxScaler(feature_range=(0, 1))
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    
+    # Scale features and target
+    scaled_features = feature_scaler.fit_transform(df[features])
+    scaled_target = target_scaler.fit_transform(df[[target]])
+    
+    # Save scalers and processed data
+    joblib.dump(feature_scaler, 'feature_scaler.pkl')
+    joblib.dump(target_scaler, 'target_scaler.pkl')
+    df[features].to_csv('bitcoin_data_processed.csv', index=False)
     
     # Create sequences
     X, y = [], []
-    for i in range(lookback, len(scaled_data)):
-        X.append(scaled_data[i-lookback:i, :])
-        y.append(scaled_data[i, 0])  # Predict Close price
+    for i in range(lookback, len(scaled_features)):
+        X.append(scaled_features[i-lookback:i, :])
+        y.append(scaled_target[i, 0])
     
-    X = np.array(X)
-    y = np.array(y)
-    
-    # Save artifacts
-    joblib.dump(scaler, 'scaler.pkl')
-    return X, y, scaler
+    return np.array(X), np.array(y), feature_scaler, target_scaler
 
 def build_model(input_shape):
-    """Enhanced LSTM architecture with dropout"""
-    model = Sequential()
-    model.add(LSTM(128, return_sequences=True, input_shape=input_shape))
-    model.add(Dropout(0.3))
-    model.add(LSTM(64))
-    model.add(Dropout(0.2))
-    model.add(Dense(1))
-    
+    """LSTM model with dropout"""
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=input_shape),
+        Dropout(0.3),
+        LSTM(64),
+        Dropout(0.2),
+        Dense(1)
+    ])
     model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
-def train_model(X, y):
-    """Train with early stopping"""
-    model = build_model((X.shape[1], X.shape[2]))
-    
-    early_stop = EarlyStopping(
-        monitor='val_loss',
-        patience=10,
-        restore_best_weights=True
-    )
-    
-    history = model.fit(
-        X, y,
-        epochs=100,
-        batch_size=32,
-        validation_split=0.2,
-        callbacks=[early_stop],
-        verbose=1
-    )
-    
-    model.save('btc_predictor.h5')
-    return model, history
-
-def evaluate_model(model, X_test, y_test, scaler):
-    """Enhanced evaluation with visualization"""
-    # Make predictions
-    y_pred = model.predict(X_test)
-    
-    # Inverse transform Close prices
-    close_scaler = MinMaxScaler().fit(df[['Close']].values)
-    y_pred_actual = close_scaler.inverse_transform(y_pred)
-    y_test_actual = close_scaler.inverse_transform(y_test.reshape(-1, 1))
-    
-    # Calculate metrics
-    mae = np.mean(np.abs(y_pred_actual - y_test_actual))
-    rmse = np.sqrt(np.mean((y_pred_actual - y_test_actual)**2))
-    
-    print(f"\nValidation MAE: ${mae:.2f}")
-    print(f"Validation RMSE: ${rmse:.2f}")
-    
-    # Plot predictions
-    plt.figure(figsize=(12,6))
-    plt.plot(y_test_actual[-100:], label='Actual Price')
-    plt.plot(y_pred_actual[-100:], label='Predicted Price', linestyle='--')
-    plt.title('Actual vs Predicted Prices (Last 100 Days)')
-    plt.xlabel('Time Step')
-    plt.ylabel('Price (USD)')
-    plt.legend()
-    plt.show()
-
 if __name__ == "__main__":
-    # Download and preprocess data
+    # Download and process data
     df = download_data()
-    X, y, scaler = preprocess_data(df)
+    X, y, feature_scaler, target_scaler = preprocess_data(df)
     
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(
@@ -127,16 +83,14 @@ if __name__ == "__main__":
     )
     
     # Train model
-    model, history = train_model(X_train, y_train)
-    
-    # Evaluate
-    evaluate_model(model, X_test, y_test, scaler)
-    
-    # Plot training history
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.title('Model Training Progress')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.show()
+    model = build_model((X_train.shape[1], X_train.shape[2]))
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model.fit(
+        X_train, y_train,
+        epochs=100,
+        batch_size=32,
+        validation_split=0.2,
+        callbacks=[early_stop],
+        verbose=1
+    )
+    model.save('btc_predictor.h5')
